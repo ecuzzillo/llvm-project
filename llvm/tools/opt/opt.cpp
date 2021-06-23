@@ -11,7 +11,6 @@
 // line, They are run in the order specified.
 //
 //===----------------------------------------------------------------------===//
-
 #include "BreakpointPrinter.h"
 #include "NewPMDriver.h"
 #include "PassPrinters.h"
@@ -27,6 +26,7 @@
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -58,8 +58,278 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <algorithm>
 #include <memory>
+
+/*
+ * BEGIN PASTE FROM BURST
+ */
+using MultiLLVMAlign = unsigned;
+
+#include "llvm/IR/InstVisitor.h"
+
+bool isLifetimeStartOrEnd(llvm::Instruction *inst) {
+  auto myintrinsicinst = dyn_cast_or_null <IntrinsicInst>(inst);
+  if (myintrinsicinst == NULL)
+    return false;
+  Intrinsic::ID myID = myintrinsicinst->getIntrinsicID();
+  return (myID == Intrinsic::lifetime_start || myID == Intrinsic::lifetime_end);
+}
+
+struct EarlyMemOpts final : llvm::InstVisitor<EarlyMemOpts> {
+  EarlyMemOpts() {}
+
+  bool run(llvm::Function &);
+
+  void visitStoreInst(llvm::StoreInst &) const;
+
+  void visitAllocaInst(llvm::AllocaInst &) const;
+
+  void visitExtractValueInst(llvm::ExtractValueInst &) const;
+
+  static llvm::StringRef getPassName() { return "Burst Early Mem Opts"; }
+
+private:
+  mutable bool modified = false;
+
+  // 32 bytes was chosen here because that catches the common-enough-case where
+  // the user has a struct that is a pair of vectors (like position/direction
+  // float3's).
+  const unsigned smallMemoryOperationCutoff = 32;
+};
+
+bool EarlyMemOpts::run(llvm::Function &function) {
+  /*dbgs() << "IR before early mem opts:"
+         << "\n";
+  function.dump();*/
+  visit(function);
+  /*dbgs() << "IR after early mem opts:" << "\n";
+  function.dump();
+  if (function.getName().contains("Execute"))
+    dbgs() << "ohai\n";*/
+
+  return modified;
+}
+
+void EarlyMemOpts::visitStoreInst(llvm::StoreInst &store) const {
+  llvm::LoadInst *const load =
+      llvm::dyn_cast<llvm::LoadInst>(store.getValueOperand());
+
+  // If we don't have a load, bail.
+  if (!load) {
+    return;
+  }
+
+  // If they are not in the same block, bail.
+  if (load->getParent() != store.getParent()) {
+    return;
+  }
+
+  llvm::Type *const storeType = store.getValueOperand()->getType();
+
+  // If the value we are storing is not an aggregate. bail.
+  if (!storeType->isAggregateType()) {
+    return;
+  }
+
+  const llvm::DataLayout &dataLayout = store.getModule()->getDataLayout();
+
+  // If the store is less than the cutoff, bail.
+  if (dataLayout.getTypeStoreSize(storeType) <= smallMemoryOperationCutoff) {
+    return;
+  }
+
+  for (llvm::Instruction *next = load->getNextNode(); next != &store;
+       next = next->getNextNode()) {
+    // If any of the instructions between the load/store can write to memory,
+    // bail.
+    if (/*!next->isLifetimeStartOrEnd()*/
+        !isLifetimeStartOrEnd(next)
+		&& next->mayWriteToMemory()) {
+      return;
+    }
+  }
+
+  llvm::IRBuilder<> builder(&store);
+
+  llvm::Value *const dst =
+      builder.CreateBitCast(store.getPointerOperand(), builder.getInt8PtrTy());
+  llvm::Value *const src =
+      builder.CreateBitCast(load->getPointerOperand(), builder.getInt8PtrTy());
+  llvm::Value *const size =
+      builder.getInt64(dataLayout.getTypeStoreSize(storeType));
+
+  const unsigned dstAlignment = store.getAlignment();
+  const unsigned srcAlignment = load->getAlignment();
+
+  llvm::CallInst *const call = //multiLLVMCreateMemMove(
+      builder.CreateMemMove(dst, src, size, srcAlignment);
+
+  // Copy over the debug location from the store.
+  call->setDebugLoc(store.getDebugLoc());
+
+  // And tidy up after ourselves.
+  store.eraseFromParent();
+
+  if (load->hasNUses(0)) {
+    load->eraseFromParent();
+  }
+
+  modified = true;
+}
+
+void EarlyMemOpts::visitAllocaInst(llvm::AllocaInst &alloca) const {
+  // If the alloca is not constant sized, bail.
+  if (!llvm::isa<llvm::Constant>(alloca.getArraySize())) {
+    return;
+  }
+
+  llvm::Function *const function = alloca.getFunction();
+  llvm::BasicBlock *const entry = &function->getEntryBlock();
+
+  // If the alloca is in the entry block, bail.
+  if (alloca.getParent() == entry) {
+    return;
+  }
+
+  // We'll insert a lifetime on the alloca in the block where it was originally
+  // used.
+  llvm::IRBuilder<> builder(alloca.getParent()->getFirstNonPHI());
+  builder.CreateLifetimeStart(&alloca);
+
+  // Otherwise we want to hoist the alloca into the entry block to make it what
+  // LLVM considers a static allocation.
+  alloca.moveBefore(entry->getFirstNonPHI());
+
+  modified = true;
+}
+
+void EarlyMemOpts::visitExtractValueInst(
+    llvm::ExtractValueInst &extractValue) const {
+  llvm::LoadInst *const load =
+      llvm::dyn_cast<llvm::LoadInst>(extractValue.getAggregateOperand());
+
+  // If we don't have a load, bail.
+  if (!load) {
+    return;
+  }
+
+  // If they are not in the same block, bail.
+  if (load->getParent() != extractValue.getParent()) {
+    return;
+  }
+
+  llvm::Type *const aggregateType =
+      extractValue.getAggregateOperand()->getType();
+
+  // If the value we are storing is not an aggregate. bail.
+  if (!aggregateType->isAggregateType()) {
+    return;
+  }
+
+  const llvm::DataLayout &dataLayout =
+      extractValue.getModule()->getDataLayout();
+
+  // If the extract is less than the cutoff, bail.
+  if (dataLayout.getTypeStoreSize(aggregateType) <=
+      smallMemoryOperationCutoff) {
+    return;
+  }
+
+  for (llvm::Instruction *next = load->getNextNode(); next != &extractValue;
+       next = next->getNextNode()) {
+    // If any of the instructions between the load/store can write to memory,
+    // bail.
+
+    if (/*!next->isLifetimeStartOrEnd()*/
+        !isLifetimeStartOrEnd(next)
+		&& next->mayWriteToMemory()) {
+      return;
+    }
+  }
+
+  llvm::IRBuilder<> builder(&extractValue);
+
+  llvm::SmallVector<llvm::Value *, 2> indices;
+  indices.push_back(builder.getInt32(0));
+
+  for (const uint32_t index : extractValue.indices()) {
+    indices.push_back(builder.getInt32(index));
+  }
+
+  llvm::LoadInst *const newLoad =
+      builder.CreateLoad(builder.CreateGEP(load->getPointerOperand(), indices));
+  newLoad->setAlignment(MultiLLVMAlign(1));
+
+  // Copy over the debug location from the store.
+  newLoad->setDebugLoc(extractValue.getDebugLoc());
+
+  extractValue.replaceAllUsesWith(newLoad);
+
+  // And tidy up after ourselves.
+  extractValue.eraseFromParent();
+
+  if (load->hasNUses(0)) {
+    load->eraseFromParent();
+  }
+
+  modified = true;
+}
+
+struct EarlyMemOptsPass final : llvm::PassInfoMixin<EarlyMemOptsPass> {
+  llvm::PreservedAnalyses run(llvm::Function &function,
+                              llvm::FunctionAnalysisManager &analysisManager) {
+    if (pass.run(function)) {
+      return llvm::PreservedAnalyses::none();
+    } else {
+      return llvm::PreservedAnalyses::all();
+    }
+  }
+
+  static llvm::StringRef name() { return EarlyMemOpts::getPassName(); }
+
+  static bool isRequired() { return true; }
+
+private:
+  EarlyMemOpts pass;
+};
+
+void burst_AddEarlyMemOptsPass(llvm::FunctionPassManager &fpm) {
+  fpm.addPass(EarlyMemOptsPass());
+}
+
+struct EarlyMemOptsLegacyPass final : public llvm::FunctionPass {
+  explicit EarlyMemOptsLegacyPass() : llvm::FunctionPass(ID) {}
+
+  bool runOnFunction(llvm::Function &function) override {
+    return pass.run(function);
+  }
+
+  void getAnalysisUsage(llvm::AnalysisUsage &analysisUsage) const override {
+    analysisUsage.setPreservesCFG();
+  }
+
+  llvm::StringRef getPassName() const override {
+    return "Burst Early Mem Opts";
+  }
+
+  static char ID;
+
+private:
+  EarlyMemOpts pass;
+};
+
+char EarlyMemOptsLegacyPass::ID;
+
+llvm::Pass *burst_CreateEarlyMemOptsLegacyPass() {
+  return new EarlyMemOptsLegacyPass();
+}
+/*
+* END PASTE FROM BURST
+*/
+
 using namespace llvm;
 using namespace opt_tool;
+
+
 
 // The OptimizationList is automatically populated with registered Passes by the
 // PassNameParser.
@@ -564,7 +834,10 @@ int main(int argc, char **argv) {
   // The -disable-simplify-libcalls flag actually disables all builtin optzns.
   if (DisableSimplifyLibCalls)
     TLII.disableAllFunctions();
+
   Passes.add(new TargetLibraryInfoWrapperPass(TLII));
+  //adding it here causes it to receive already bullshitized IR
+  //Passes.add(burst_CreateEarlyMemOptsLegacyPass());
 
   // Add internal analysis passes from the target machine.
   Passes.add(createTargetTransformInfoWrapperPass(TM ? TM->getTargetIRAnalysis()
@@ -574,6 +847,7 @@ int main(int argc, char **argv) {
   if (OptLevelO0 || OptLevelO1 || OptLevelO2 || OptLevelOs || OptLevelOz ||
       OptLevelO3) {
     FPasses.reset(new legacy::FunctionPassManager(M.get()));
+    FPasses->add(burst_CreateEarlyMemOptsLegacyPass());
     FPasses->add(createTargetTransformInfoWrapperPass(
         TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis()));
   }
